@@ -1,0 +1,170 @@
+import json
+import os
+import requests
+from bs4 import BeautifulSoup
+from pymongo import MongoClient
+import time
+import logging
+import re
+import random
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# MongoDB client setup
+client = MongoClient(os.environ['MONGO_URI'])
+db = client[os.environ['DB_NAME']]
+collection = db[os.environ['COLLECTION_NAME']]
+
+# Rate limit: Number of requests allowed per minute
+requests_per_minute = 10
+
+def lambda_handler(event, context):
+    try:
+        for record in event['Records']:
+            start_time = time.time()
+            srn = record['body']
+
+            # Call the process_srn function with rate limiting
+            process_srn_with_rate_limiting(srn)
+
+            end_time = time.time()
+            execution_time = end_time - start_time
+            logger.info(f"Lambda execution time: {execution_time} seconds")
+    except Exception as e:
+        logger.error(f"An error occurred while processing SQS messages: {e}")
+
+def process_srn_with_rate_limiting(srn):
+    try:
+        url = "https://www.mysite.in/myportal/trackPayStatus.do"
+        
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:53.0) Gecko/20100101 Firefox/53.0",
+            "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:50.0) Gecko/20100101 Firefox/50.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.79 Safari/537.36 Edge/14.14393",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:87.0) Gecko/20100101 Firefox/87.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:86.0) Gecko/20100101 Firefox/86.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:85.0) Gecko/20100101 Firefox/85.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:84.0) Gecko/20100101 Firefox/84.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:83.0) Gecko/20100101 Firefox/83.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:82.0) Gecko/20100101 Firefox/82.0"
+        ]
+
+        headers = {
+            "User-Agent": random.choice(user_agents),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Connection": "keep-alive",    #added by AN
+            "Accept-Language": "en-CA,en-US;q=0.7,en;q=0.3",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",  #added by AN
+        }
+
+        payload = {
+            "counter": "",
+            "srn": srn,
+            'bypass': 'cloudflare'
+        }
+
+        retries = 2  # Number of retries
+
+        for attempt in range(retries):
+            try:
+                start_time = time.time()
+                response = requests.post(url, headers=headers, data=payload, timeout=5)
+                response.raise_for_status()
+                end_time = time.time()
+                response_time = end_time - start_time
+                print(f"Response time for {srn}: {response_time:.2f} seconds")
+                break  # If the request is successful, break out of the loop
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout occurred for srn {srn}. Attempt {attempt + 1} of {retries}.")
+                if attempt == retries - 1:
+                    response = None
+                    break
+            except requests.exceptions.HTTPError as err:
+                if 400 <= err.response.status_code < 600:
+                    logger.error(f"HTTP Error {err.response.status_code} for SRN {srn}: {err}")
+                    if attempt == retries - 1:
+                        response = None
+                        break
+            except requests.exceptions.RequestException as req_ex:
+                logger.error(f"Request Error for srn {srn}: {req_ex}")
+                response = None
+                break
+            except Exception as ex:
+                logger.error(f"An unexpected error occurred for srn {srn}: {ex}")
+                response = None
+                break
+            finally:
+                # Introduce random rate limiting to avoid making too many requests in a short time
+                time.sleep(random.uniform(0.5, 5))  # Random delay between 0.5 and 1.5 seconds
+
+        if response:
+            soup = BeautifulSoup(response.text, "html.parser")
+            table = soup.find(id="srnDetailsTab1")
+            data = []
+            
+            if table:
+                for row in table.find_all('tr', {'class': 'table-row'}):
+                    columns = row.find_all('td')
+                    payment_status_text = columns[0].text.strip() if columns else None
+
+                    match = re.search(r'(EXPIRED|NOT PAID|Paid on (\d{2}-\d{2}-\d{4}))', payment_status_text)
+
+                    if match:
+                        status = match.group(1)
+                        if status in ['EXPIRED', 'NOT PAID']:
+                            row_data = {'status': status}
+                        else:
+                            paid_on_date = match.group(2)
+                            row_data = {'status': 'PAID', 'paidOn': paid_on_date}
+
+                    else:
+                        logger.warning(f"Could not determine payment status for SRN {srn}")
+
+                logger.info(f"Storing in MongoDB for SRN: {srn}")
+
+                collection.update_one({'annual_e_filing_forms.SRN': srn},
+                                       {'$set': {'annual_e_filing_forms.$.paymentStatus': row_data},
+                                        '$unset': {'annual_e_filing_forms.$.paymentStatusError2': "",
+                                                   'annual_e_filing_forms.$.paymentStatusError': ""}},
+                                       upsert=False)
+            elif soup.find("ul", class_="errorMessage"):
+                error_message_container = soup.find("ul", class_="errorMessage")
+                if error_message_container:
+                    error_messages = error_message_container.find_all('li')
+                    for error_message in error_messages:
+                        error_text = error_message.get_text()
+                        logger.error(f"Error message for srn {srn}: {error_text}")
+                    collection.update_one({'annual_e_filing_forms.SRN': srn},
+                                           {'$set': {'annual_e_filing_forms.$.paymentStatusError': True}},
+                                           upsert=True)
+                else:
+                    print("no error message container")
+            else:
+                collection.update_one({'annual_e_filing_forms.SRN': srn},
+                                       {'$set': {'annual_e_filing_forms.$.paymentStatusError2': True}},
+                                       upsert=True)
+                print(f"table error for srn {srn}")
+
+        elif response is None:
+            collection.update_one({'annual_e_filing_forms.SRN': srn},
+                                   {'$set': {'annual_e_filing_forms.$.ServerError': True}}, upsert=True)
+            print(f"server error for srn {srn}")
+        else:
+            print("new error")
+
+    except Exception as ex:
+        logger.error(f"An unexpected error occurred for SRN {srn}: {ex}")
